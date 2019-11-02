@@ -1,0 +1,200 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+
+namespace MergeXLSX
+{
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            var allSourceFiles = Directory.GetFiles(@"D:\Documents\XLSX MERGE\SourceFiles").ToList();
+
+            if (allSourceFiles.Count <= 0) return;
+
+            var finalOpenXMLPath = CopyTheFisrtSourceOpenXML(allSourceFiles.First());
+            allSourceFiles.Add(finalOpenXMLPath);
+
+            foreach (var eachFilePath in allSourceFiles)
+            {
+                var updatedPath = Path.ChangeExtension(eachFilePath, "zip");
+                System.IO.File.Move(eachFilePath, updatedPath);
+                ZipFile.ExtractToDirectory(updatedPath, Path.Combine(Path.GetDirectoryName(updatedPath), Path.GetFileNameWithoutExtension(updatedPath)));
+            }
+
+            //copy all the sheets to merged output
+            var allExtractedFolders = Directory.GetDirectories(@"D:\Documents\XLSX MERGE\SourceFiles");
+
+            var destFolder = allExtractedFolders.First(x => x.EndsWith(Path.GetFileNameWithoutExtension(finalOpenXMLPath)));
+            var finalWorkSheetPath = Path.Combine(destFolder, "xl", "worksheets");
+
+            int sheetIndex = Directory.GetFiles(finalWorkSheetPath).Length;
+
+            List<string> allMergedSheets = new List<string>();
+
+            foreach (var eachFolder in allExtractedFolders)
+            {
+                if (eachFolder != destFolder)
+                {
+                    var sheetFolder = GetSheetPath(eachFolder);
+
+                    var sheets = Directory.GetFiles(sheetFolder);
+                    foreach (var eachSheet in sheets)
+                    {
+                        sheetIndex++;
+                        string destSheetName = Path.Combine(finalWorkSheetPath, Path.GetFileName(eachSheet).Replace(Path.GetFileNameWithoutExtension(eachSheet), "sheet" + sheetIndex));
+                        File.Copy(eachSheet, destSheetName);
+                        allMergedSheets.Add(Path.GetFileNameWithoutExtension(destSheetName));
+                    }
+                }
+            }
+
+            var sheetRankKVP = UpdateWorkbookXMLRels(destFolder, allMergedSheets);
+
+            //UpdateAppXML(destFolder, allMergedSheets, sheetRankKVP);
+            UpdateWorkbookXML(destFolder, allMergedSheets, sheetRankKVP);
+
+            UpdateContentTypes(destFolder, allMergedSheets, sheetRankKVP);
+            var destinationArchiveFileName = Path.Combine(@"D:\Documents\XLSX MERGE\SourceFiles", "Merged.zip");
+
+            ZipFile.CreateFromDirectory(destFolder, destinationArchiveFileName, CompressionLevel.NoCompression, false);
+
+            var updatedMergedFinalPath = Path.ChangeExtension(destinationArchiveFileName, "xlsx");
+            System.IO.File.Move(destinationArchiveFileName, updatedMergedFinalPath);
+        }
+
+        private static void UpdateContentTypes(string destFolder, List<string> allMergedSheets, Dictionary<string, string> sheetRankKVP)
+        {
+            var contentTypesXMLPath = Path.Combine(destFolder, "[Content_Types].xml");
+
+            var contentTypesXMLDoc = XDocument.Load(contentTypesXMLPath);
+
+            var typesTag = contentTypesXMLDoc.Descendants().Where(x => x.Name.LocalName == "Types").FirstOrDefault();
+
+            XElement overrideSheetElement = contentTypesXMLDoc.Descendants().Where(x => x.Name.LocalName == "Override" && x.Attribute("PartName").Value.Contains("sheet1.xml")).FirstOrDefault();
+            string partName = overrideSheetElement.Attribute("PartName").Value;
+            string contentType = overrideSheetElement.Attribute("ContentType").Value;
+
+            foreach (var eachMergeSheet in allMergedSheets)
+            {
+                var partNameValue = partName.Replace(Path.GetFileNameWithoutExtension(partName), eachMergeSheet);
+                var overrideTag = new XElement("Override", new XAttribute("PartName", partNameValue), new XAttribute("ContentType", contentType));
+                typesTag.Add(overrideTag);
+            }
+            typesTag.Save(contentTypesXMLPath);
+        }
+
+        private static void UpdateWorkbookXML(string destFolder, List<string> allMergedSheets, Dictionary<string, string> sheetRankKVP)
+        {
+            var workbookXMLPath = Path.Combine(destFolder, "xl", "workbook.xml");
+
+            var workbookXMLDoc = XDocument.Load(workbookXMLPath);
+            XNamespace ns = workbookXMLDoc.Root.GetNamespaceOfPrefix("r");
+
+            var sheetsTag = workbookXMLDoc.Descendants().Where(x => x.Name.LocalName == "sheets").FirstOrDefault();
+
+            int highestSheetId = workbookXMLDoc.Descendants().Where(x => x.Name.LocalName == "sheet").Attributes("sheetId").Select(x => Convert.ToInt32(x.Value)).Max();
+
+            foreach (var eachMergeSheet in allMergedSheets)
+            {
+                highestSheetId++;
+                var rid = sheetRankKVP[eachMergeSheet];
+                var sheetTag = new XElement("sheet", new XAttribute("name", FirstCharToUpper(eachMergeSheet)), 
+                                                        new XAttribute("sheetId", highestSheetId.ToString()), 
+                                                        new XAttribute( ns + "id", rid));
+                sheetsTag.Add(sheetTag);
+            }
+            workbookXMLDoc.Save(workbookXMLPath);
+
+            foreach (var node in workbookXMLDoc.Root.Descendants()
+                                .Where(n => n.Name.NamespaceName == ""))
+            {
+                
+                node.Attributes("xmlns").Remove();
+                node.Name = node.Parent.Name.Namespace + node.Name.LocalName;
+            }
+            workbookXMLDoc.Save(workbookXMLPath);
+        }
+
+        private static void UpdateAppXML(string destFolder, List<string> allMergedSheets, Dictionary<string, string> sheetRankKVP)
+        {
+
+            var appXMLPath = Path.Combine(destFolder, "docProps", "app.xml");
+
+            var appXmlDoc = XDocument.Load(appXMLPath);
+            XNamespace ns = appXmlDoc.Root.GetNamespaceOfPrefix("vt");
+
+            var lpstrParentTag = appXmlDoc.Descendants().Where(x => x.Name.LocalName == "vector" && x.Attribute("baseType").Value == "lpstr").FirstOrDefault();
+            foreach (var eachMergeSheet in allMergedSheets)
+            {
+                var lpstrTag = new XElement(ns + "lpstr", FirstCharToUpper(eachMergeSheet));
+                lpstrParentTag.Add(lpstrTag);
+            }
+            appXmlDoc.Save(appXMLPath);
+        }
+
+        private static string FirstCharToUpper(string input)
+        {
+            if (String.IsNullOrEmpty(input))
+                throw new ArgumentException("ARGH!");
+            return input.First().ToString().ToUpper() + String.Join("", input.Skip(1));
+        }
+
+        private static Dictionary<string, string> UpdateWorkbookXMLRels(string destFolder, List<string> allMergedSheets)
+        {
+            var workbookXMLRelsPath = Path.Combine(destFolder, "xl", "_rels", "workbook.xml.rels");
+
+            var relsDoc = XDocument.Load(workbookXMLRelsPath);
+
+            int highestRLDRank = relsDoc.Descendants().Where(x => x.Name.LocalName == "Relationship").Attributes("Id").Select(x => Convert.ToInt32(x.Value.Remove(0, 3))).Max();
+
+            Dictionary<string, string> sheetRankKVP = new Dictionary<string, string>();
+
+            var firstSheetTag = relsDoc.Descendants().Where(x => x.Name.LocalName == "Relationship").First(x => x.Attribute("Target").Value == "worksheets/sheet1.xml");
+            var typeAttributeValue = firstSheetTag.Attribute("Type").Value;
+            var targetAttributeValue = firstSheetTag.Attribute("Target").Value;
+
+            foreach (var eachMergeSheet in allMergedSheets)
+            {
+                highestRLDRank++;
+                string rldRank = string.Concat("rId", highestRLDRank);
+                sheetRankKVP.Add(eachMergeSheet, rldRank);
+
+                targetAttributeValue = targetAttributeValue.Replace(Path.GetFileNameWithoutExtension(targetAttributeValue), eachMergeSheet);
+
+                XElement relationshipTag = new XElement("Relationship", new XAttribute("Id", rldRank), new XAttribute("Type", typeAttributeValue), new XAttribute("Target", targetAttributeValue));
+                relsDoc.Descendants().Where(x => x.Name.LocalName == "Relationships").FirstOrDefault().Add(relationshipTag);
+            }
+
+            relsDoc.Save(workbookXMLRelsPath);
+            
+
+            foreach (var node in relsDoc.Root.Descendants()
+                                .Where(n => n.Name.NamespaceName == ""))
+            {
+                node.Attributes("xmlns").Remove();
+                // Inherit the parent namespace instead
+                node.Name = node.Parent.Name.Namespace + node.Name.LocalName;
+            }
+            relsDoc.Save(workbookXMLRelsPath);
+            return sheetRankKVP;
+        }
+
+        private static string GetSheetPath(string rootFolder)
+        {
+            return Path.Combine(rootFolder, "xl", "worksheets");
+        }
+
+        private static string CopyTheFisrtSourceOpenXML(string firstSourceFilePath)
+        {
+            var destinationFileName = firstSourceFilePath.Replace(Path.GetFileNameWithoutExtension(firstSourceFilePath), "MergedOutPut");
+            File.Copy(firstSourceFilePath, destinationFileName);
+            return destinationFileName;
+        }
+    }
+}
